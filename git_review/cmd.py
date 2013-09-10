@@ -61,6 +61,7 @@ _has_color = None
 class colors:
     yellow = '\033[33m'
     green = '\033[92m'
+    red   = '\033[31m'
     reset = '\033[0m'
 
 
@@ -682,6 +683,106 @@ def list_reviews(remote):
     return 0
 
 
+def graph_changes(remote):
+    (hostname, username, port, project_name) = \
+        parse_git_show(remote, "Push")
+
+    if port is not None:
+        port = "-p %s" % port
+    else:
+        port = ""
+    if username is None:
+        userhost = hostname
+    else:
+        userhost = "%s@%s" % (username, hostname)
+
+    change_info = None
+    output = run_command_exc(
+        CannotQueryOpenChangesets,
+        "ssh", "-x", port, userhost,
+        "gerrit", "query",
+        "--patch-sets",
+        "--format=JSON project:%s status:open" % project_name)
+
+    changes = dict() # ChangeNumber -> Change
+    patchsets = dict() # SHA-1 -> Patchset
+
+    for line in output.split("\n"):
+        # Warnings from ssh wind up in this output
+        if line[0] != "{":
+            print(line)
+            continue
+        try:
+            change_info = json.loads(line)
+        except Exception:
+            if VERBOSE:
+                print(output)
+            raise(CannotParseOpenChangesets, sys.exc_info()[1])
+
+        if 'type' in change_info:
+            break
+
+        change_id = change_info["number"]
+        changes[change_id] = change_info
+        change_info["needed-by"] = list()
+        change_info["depends-on"] = list()
+        change_info["outdated"] = False
+
+        for patchSet in change_info["patchSets"]:
+            patchSet["change"] = change_id
+            patchsets[patchSet["revision"]] = patchSet
+            if not ("mostRecentPatchset" in change_info) \
+               or (int (patchSet["number"]) > int(change_info["mostRecentPatchset"]["number"])):
+                change_info["mostRecentPatchset"] = patchSet
+
+    # Construct the dependency graph
+    for (change_id, change) in changes.items():
+        newestPatchset = change["mostRecentPatchset"]
+        parentSHA = newestPatchset["parents"][0]
+        if parentSHA in patchsets:
+            parentPatchset = patchsets[parentSHA]
+            parentChange = changes[parentPatchset["change"]]
+            parentChange["needed-by"] += [change]
+            change["depends-on"] += [parentChange]
+            change["outdated"] = (parentPatchset != parentChange["mostRecentPatchset"])
+
+    def format_change(change):
+        fields = [change["number"]+ "/" + change["mostRecentPatchset"]["number"], 
+                  change["branch"],
+                  change["subject"]]
+        if change["outdated"]:
+            fields.append("[OUTDATED]")
+        else:
+            fields.append("")
+
+        if check_color_support():
+            review_field_color = (colors.yellow, colors.green, "", colors.red)
+            color_reset = colors.reset
+        else:
+            review_field_color = ("", "", "", "")
+            color_reset = ""
+
+        format_string = " ".join(
+            [color + "%s" + color_reset  for color in review_field_color])
+        return format_string % tuple(fields)
+
+    def print_change_chain(root_change, indent = 0):
+        if indent != 0:
+            print(" " * indent + "`->", format_change(root_change))
+        else:
+            print(format_change(root_change))
+        for change in root_change["needed-by"]:
+            print_change_chain(change, indent + 3)
+
+
+    for (change_id, change) in changes.items():
+        if len(change["depends-on"]) != 0:
+            continue
+        print_change_chain(change)
+
+    return 0
+
+
 class CannotQueryPatchSet(CommandFailed):
     "Cannot query patchset information"
     EXIT_CODE = 34
@@ -997,6 +1098,8 @@ def main():
                              "master on successful submission")
     parser.add_argument("-l", "--list", dest="list", action="store_true",
                         help="List available reviews for the current project")
+    parser.add_argument("-g", "--graph", dest="graph", action="store_true",
+                        help="Graph the projects dependency graph")
     parser.add_argument("-y", "--yes", dest="yes", action="store_true",
                         help="Indicate that you do, in fact, understand if "
                              "you are submitting more than one patch")
@@ -1067,6 +1170,9 @@ def main():
                 cherrypick_review("-n")
             if options.cherrypickindicate:
                 cherrypick_review("-x")
+        return
+    elif options.graph:
+        graph_changes(remote)
         return
     elif options.list:
         list_reviews(remote)
